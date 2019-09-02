@@ -1,0 +1,308 @@
+# -*- coding: utf-8 -*-
+'''ResNet50 model for Keras.
+# Reference:
+- [Deep Residual Learning for Image Recognition](https://arxiv.org/abs/1512.03385)
+Adapted from code contributed by BigMoyan.
+'''
+
+
+# 不该文件定义的是resnet，而是以resnet为base的frcnn
+
+from __future__ import print_function
+from __future__ import absolute_import
+
+from keras.layers import Input, Add, Dense, Activation, Flatten, Convolution2D,MaxPooling2D, ZeroPadding2D, UpSampling2D, \
+    AveragePooling2D, TimeDistributed, merge, Cropping2D
+
+from keras import backend as K
+
+from keras_frcnn.roi_pooling_conv import RoiPoolingConv
+from keras_frcnn.fixed_batch_normalization import FixedBatchNormalization
+
+
+def get_weight_path():
+    if K.image_dim_ordering() == 'th':
+        return 'resnet50_weights_th_dim_ordering_th_kernels_notop.h5'
+    else:
+        return 'resnet50_weights_tf_dim_ordering_tf_kernels.h5'
+
+
+# get_img_output_length函数输入特征层的宽和高，返回一次卷积运算后(stride=2,卷积核=[7, 3, 1, 1])的大小
+        # 这个函数仅仅适用于计算resnet50版本的basenet输出的share_layer的尺寸
+def get_img_output_length(width, height):
+    def get_output_length(input_length):
+        # zero_pad
+        input_length += 6
+        # apply 4 strided convolutions
+        filter_sizes = [7, 3, 1,1] #[7, 3, 1, 1]
+        stride = 2
+        for filter_size in filter_sizes:
+            input_length = (input_length - filter_size + stride) // stride
+        return input_length*2
+
+    return get_output_length(width), get_output_length(height)
+
+# 也是Resnet中的一个基础模块
+#  与conv_block的唯二区别的：1、stride=1, 2、没有shortcut    
+def identity_block(input_tensor, kernel_size, filters, stage, block, trainable=True):
+    nb_filter1, nb_filter2, nb_filter3 = filters
+
+    if K.image_dim_ordering() == 'tf':
+        bn_axis = 3
+    else:
+        bn_axis = 1
+
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    x = Convolution2D(nb_filter1, (1, 1), name=conv_name_base + '2a', trainable=trainable)(input_tensor)
+    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
+    x = Activation('relu')(x)
+
+    x = Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', name=conv_name_base + '2b',
+                      trainable=trainable)(x)
+    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
+    x = Activation('relu')(x)
+
+    x = Convolution2D(nb_filter3, (1, 1), name=conv_name_base + '2c', trainable=trainable)(x)
+    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
+
+    x = Add()([x, input_tensor])
+    x = Activation('relu')(x)
+    return x
+
+# td表示time distributed
+def identity_block_td(input_tensor, kernel_size, filters, stage, block, trainable=True):
+    # identity block time distributed
+
+    nb_filter1, nb_filter2, nb_filter3 = filters
+    if K.image_dim_ordering() == 'tf':
+        bn_axis = 3
+    else:
+        bn_axis = 1
+
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    # 我们可以使用包装器TimeDistributed包装Dense，以产生针对各个时间步（默认输入tensor的第一维，也就是batch之后的那个维度是时间维度）信号的独立全连接。
+    x = TimeDistributed(Convolution2D(nb_filter1, (1, 1), trainable=trainable, kernel_initializer='normal'),
+                        name=conv_name_base + '2a')(input_tensor)  # Convolution2D的stride默认是1
+    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2a')(x)
+    x = Activation('relu')(x)
+
+    x = TimeDistributed(
+        Convolution2D(nb_filter2, (kernel_size, kernel_size), trainable=trainable, kernel_initializer='normal',
+                      padding='same'), name=conv_name_base + '2b')(x)
+    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2b')(x)
+    x = Activation('relu')(x)
+
+    x = TimeDistributed(Convolution2D(nb_filter3, (1, 1), trainable=trainable, kernel_initializer='normal'),
+                        name=conv_name_base + '2c')(x)
+    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2c')(x)
+
+    x = Add()([x, input_tensor])
+    x = Activation('relu')(x)
+
+    return x
+
+# 定义Resnet中一个残差卷积模块
+def conv_block(input_tensor, kernel_size, filters, stage, block, strides=(2, 2), trainable=True):
+    nb_filter1, nb_filter2, nb_filter3 = filters
+    if K.image_dim_ordering() == 'tf':
+        bn_axis = 3
+    else:
+        bn_axis = 1
+
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    x = Convolution2D(nb_filter1, (1, 1), strides=strides, name=conv_name_base + '2a', trainable=trainable)(
+        input_tensor)
+    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
+    x = Activation('relu')(x)
+
+    x = Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', name=conv_name_base + '2b',
+                      trainable=trainable)(x)
+    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
+    x = Activation('relu')(x)
+
+    x = Convolution2D(nb_filter3, (1, 1), name=conv_name_base + '2c', trainable=trainable)(x)
+    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
+
+    shortcut = Convolution2D(nb_filter3, (1, 1), strides=strides, name=conv_name_base + '1', trainable=trainable)(
+        input_tensor)
+    shortcut = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '1')(shortcut)
+
+    x = Add()([x, shortcut])
+    x = Activation('relu')(x)
+    return x
+
+
+def conv_block_td(input_tensor, kernel_size, filters, stage, block, input_shape, strides=(2, 2), trainable=True):
+    # conv block time distributed
+
+    nb_filter1, nb_filter2, nb_filter3 = filters
+    if K.image_dim_ordering() == 'tf':
+        bn_axis = 3
+    else:
+        bn_axis = 1
+
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    x = TimeDistributed(
+        Convolution2D(nb_filter1, (1, 1), strides=strides, trainable=trainable, kernel_initializer='normal'),
+        input_shape=input_shape, name=conv_name_base + '2a')(input_tensor)
+    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2a')(x)
+    x = Activation('relu')(x)
+
+    x = TimeDistributed(Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', trainable=trainable,
+                                      kernel_initializer='normal'), name=conv_name_base + '2b')(x)
+    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2b')(x)
+    x = Activation('relu')(x)
+
+    x = TimeDistributed(Convolution2D(nb_filter3, (1, 1), kernel_initializer='normal'), name=conv_name_base + '2c',
+                        trainable=trainable)(x)
+    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2c')(x)
+
+    shortcut = TimeDistributed(
+        Convolution2D(nb_filter3, (1, 1), strides=strides, trainable=trainable, kernel_initializer='normal'),
+        name=conv_name_base + '1')(input_tensor)
+    shortcut = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '1')(shortcut)
+
+    x = Add()([x, shortcut])
+    x = Activation('relu')(x)
+    return x
+
+
+# 定义nn_base：是frcnn网络底部那些共享的层,在这里是ResNet。
+def nn_base(input_tensor=None, trainable=False):
+    # Determine proper input shape
+    if K.image_dim_ordering() == 'th':
+        input_shape = (3, None, None) # RGB通道在前
+    else:
+        input_shape = (None, None, 3) # RGB通道在尾
+
+    if input_tensor is None:
+        img_input = Input(shape=input_shape) # 输入的shape大小不做限定
+    else:
+        if not K.is_keras_tensor(input_tensor):
+            img_input = Input(tensor=input_tensor, shape=input_shape)
+        else:
+            img_input = input_tensor
+
+    if K.image_dim_ordering() == 'tf':
+        bn_axis = 3
+    else:
+        bn_axis = 1
+
+    # ZeroPadding2D层的功能：对2D输入（如图片）的边界填充0，以控制卷积以后特征图的大小，（3,3）表示在图片边缘填充3个0
+    x = ZeroPadding2D((3, 3))(img_input)
+
+    x = Convolution2D(64, (7, 7), strides=(2, 2), name='conv1', trainable=trainable)(x)
+    print("Convolution2D shape:",x.shape)
+    x = FixedBatchNormalization(axis=bn_axis, name='bn_conv1')(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2))(x)
+    print("MaxPooling2D shape:",x.shape)
+
+    x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1), trainable=trainable)#conv_block的默认stride是2
+    print("x stage2 block a shape:",x.shape)
+    x = identity_block(x, 3, [64, 64, 256], stage=2, block='b', trainable=trainable)
+    print("x stage2 block b shape:",x.shape)
+    x = identity_block(x, 3, [64, 64, 256], stage=2, block='c', trainable=trainable)
+    print("x stage2 block c shape:",x.shape)
+
+    x = conv_block(x, 3, [128, 128, 512], stage=3, block='a', trainable=trainable)#conv_block的默认stride是2
+    print("x stage3 block a shape:",x.shape)
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='b', trainable=trainable) # identity_block不改变输入输出的shape
+    print("x stage3 block b shape:",x.shape)
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='c', trainable=trainable)
+    print("x stage3 block c shape:",x.shape)
+    xstage3 = identity_block(x, 3, [128, 128, 512], stage=3, block='d', trainable=trainable)
+    print("x stage3 block d shape:",xstage3.shape)
+
+    x = conv_block(x, 3, [256, 256, 1024], stage=4, block='a', trainable=trainable)
+    print("x stage4 block a shape:",x.shape)
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='b', trainable=trainable)
+    print("x stage4 block b shape:",x.shape)
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='c', trainable=trainable)
+    print("x stage4 block c shape:",x.shape)
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='d', trainable=trainable)
+    print("x stage4 block d shape:",x.shape)
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='e', trainable=trainable)
+    print("x stage4 block e shape:",x.shape)
+    xstage4 = identity_block(x, 3, [256, 256, 1024], stage=4, block='f', trainable=trainable)
+    print("x stage4 block f shape:",xstage4.shape)
+    #identity_block(input_tensor, kernel_size, filters, stage, block, trainable=True)
+
+    # resnet的结构解读参考https://blog.csdn.net/lanran2/article/details/79057994
+    # basenet只用到了resnet50的conv1到conv4_x,剪切掉了conv5_x
+
+    # 合并两个卷积层
+    stage3_lateral = Convolution2D(1024, (1, 1), strides=(1, 1), name='stage3_lateral', trainable=trainable)(xstage3)
+    up4 = UpSampling2D(size = (2,2))(xstage4)
+    print("up4 shape:",up4.shape)
+    print("up4.get_shape()=",up4.get_shape())
+    
+    #up4 = Cropping2D(cropping=((up4.get_shape()[1]-stage3_lateral.get_shape()[1], 0), (up4.get_shape()[2]-stage3_lateral.get_shape()[2], 0)), data_format=None)(up4)
+
+    # 目前还缺一个crop层，导致不是所有情况下stage3_lateral,up4的shape都一样,从而不能Add
+    share_layer = Add()([stage3_lateral,up4])
+    print("share_layer shape:",share_layer.shape)
+    
+    return share_layer,xstage3,xstage4
+
+# 被classifier调用
+def classifier_layers(x, input_shape, trainable=False):
+    # compile times on theano tend to be very high, so we use smaller ROI pooling regions to workaround
+    # (hence a smaller stride in the region that follows the ROI pool)
+    if K.backend() == 'tensorflow':
+        x = conv_block_td(x, 3, [512, 512, 2048], stage=5, block='a', input_shape=input_shape, strides=(2, 2),
+                          trainable=trainable)
+    elif K.backend() == 'theano':
+        x = conv_block_td(x, 3, [512, 512, 2048], stage=5, block='a', input_shape=input_shape, strides=(1, 1),
+                          trainable=trainable)
+
+    x = identity_block_td(x, 3, [512, 512, 2048], stage=5, block='b', trainable=trainable)
+    x = identity_block_td(x, 3, [512, 512, 2048], stage=5, block='c', trainable=trainable)
+    x = TimeDistributed(AveragePooling2D((7, 7)), name='avg_pool')(x)
+
+    return x
+
+# 定义rpn网络，始于nn_base（base_layers）的输出
+def rpn(base_layers, num_anchors):
+    x = Convolution2D(512, (3, 3), padding='same', activation='relu', kernel_initializer='normal', name='rpn_conv1')(
+        base_layers)
+
+    x_class = Convolution2D(num_anchors, (1, 1), activation='sigmoid', kernel_initializer='uniform',
+                            name='rpn_out_class')(x)
+    x_regr = Convolution2D(num_anchors * 4, (1, 1), activation='linear', kernel_initializer='zero',
+                           name='rpn_out_regress')(x)#输出尺寸是num_anchors * 4，但为什么训练标签是num_anchors * 8？
+
+    return [x_class, x_regr, base_layers]
+
+# 定义分类器，始于nn_base（base_layers）
+def classifier(base_layers, input_rois, num_rois, nb_classes=21, trainable=False):
+    # compile times on theano tend to be very high, so we use smaller ROI pooling regions to workaround
+
+    if K.backend() == 'tensorflow':
+        pooling_regions = 14
+        input_shape = (num_rois, 14, 14, 1024)
+    elif K.backend() == 'theano':
+        pooling_regions = 7
+        input_shape = (num_rois, 1024, 7, 7)
+    # RoiPoolingConv的作用是分别将每一个ROI对应的原图区域resize为指定大小(14,14),
+    # 然后，把所有的resize后的矩阵在0轴上串联起来。
+    # 其作用就是将尺寸不一而同的ROI都调整为相同的大小，输入给后续的层，因为后续的层有全连接层，所以需要规范输入图的大小
+    out_roi_pool = RoiPoolingConv(pooling_regions, num_rois)([base_layers, input_rois]) #shape=(1, num_rois, 14, 14, 1024) dtype=float32
+    out = classifier_layers(out_roi_pool, input_shape=input_shape, trainable=True) #9个卷积层#shape=(1, num_rois, 1, 1, 2048) dtype=float32>
+
+    out = TimeDistributed(Flatten())(out) #shape=(?, num_rois, 2048) dtype=float32
+
+    out_class = TimeDistributed(Dense(nb_classes, activation='softmax', kernel_initializer='zero'),
+                                name='dense_class_{}'.format(nb_classes))(out)  #shape=(?, num_rois, nb_classes) dtype=float32
+    # note: no regression target for bg class
+    out_regr = TimeDistributed(Dense(4 * (nb_classes - 1), activation='linear', kernel_initializer='zero'),
+                               name='dense_regress_{}'.format(nb_classes))(out) #shape=(?, num_rois, 4 * (nb_classes - 1)) dtype=float32
+    return [out_class, out_regr]
