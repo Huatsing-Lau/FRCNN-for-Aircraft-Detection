@@ -12,7 +12,7 @@ Basically, this code supports both python2.7 and python3.5, the following packag
 
 ## Out of box model to predict
 
-I have trained a model to predict kitti. I will update a dropbox link here later. Let's see the result of predict:
+I have trained a model to predict xingtubei. I will update a dropbox link here later. Let's see the result of predict:
 
 ![Image text](https://github.com/Huatsing-Lau/FRCNN-for-Aircraft-Detection/blob/master/results_images/P0042__0.5__384___384.png)
 ## Train New Dataset
