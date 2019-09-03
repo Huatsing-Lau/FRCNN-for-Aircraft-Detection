@@ -33,4 +33,4 @@ python test_frcnn_xingtubei.py
 ```
 you can also using `-p` to specific single image to predict, or send a path contains many images, our program will automatically recognise that.
 
-**That's all, help you enjoy!**
+**That's all, hope you enjoy!**
